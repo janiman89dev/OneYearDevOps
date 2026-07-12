@@ -1,4 +1,4 @@
-#!/bin/bash
+	#!/bin/bash
 
 list_instances() {
     echo "Listing instances..."
@@ -16,10 +16,10 @@ local matches=$(aws ec2 describe-instances \
 
     local count=$(echo "$matches" | wc -w)
 
-    if [ "$count" -eq 0 ]; then
+    if [[ $count -eq 0 ]]; then
     echo "No instance found with name: $instance_name"
     return 1
-    elif [ "$count" -gt 1 ]; then
+    elif [[ $count -gt 1 ]]; then
     echo "Multiple instances found with name '$instance_name':"
     echo "$matches"
     echo "Refusing to act — please target a specific instance ID instead."
@@ -38,10 +38,10 @@ local matches=$(aws ec2 describe-instances \
 
     local count=$(echo "$matches" | wc -w)
 
-    if [ "$count" -eq 0 ]; then
+    if [[ $count -eq 0 ]]; then
     echo "No instance found with name: $instance_name"
     return 1
-    elif [ "$count" -gt 1 ]; then
+    elif [[ $count -gt 1 ]]; then
     echo "Multiple instances found with name '$instance_name':"
     echo "$matches"
     echo "Refusing to act — please target a specific instance ID instead."
