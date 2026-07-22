@@ -314,3 +314,195 @@ Initial ASG instances launched but registered as **Unhealthy** in the target gro
 - Without a public IP (and no NAT Gateway in place), `dnf update`/`dnf install httpd` in the user data script had no route to the internet and silently failed
 - Fixed by creating a new launch template version with **Auto-assign public IP: Enable**, and updating the ASG to use it — new instances then installed Apache successfully and passed health checks.
 
+## Domain Registration & DNS (Route 53)
+
+### AWS payment restriction encountered
+
+Attempted to register a domain directly through Route 53. This failed with `AccessDeniedException: Free Tier accounts are not supported for this service`. Investigation confirmed this is a real, documented account-level restriction — Route 53 domain registration requires a genuine chargeable payment method on file and explicitly cannot be completed using free-tier credits, regardless of account balance.
+
+Domain **transfer** into Route 53 was considered as an alternative, but ruled out: a transfer is itself a billable registration event from AWS's perspective, and would hit the same restriction. Transfers also carry independent friction (60-day domain age minimum, EPP authorization codes, 5–7 day processing time) unrelated to the payment issue.
+
+### Solution: decoupled registrar and DNS provider
+
+Registered `jankodev.site` through a Romanian domain registrar instead, and used Route 53 purely as the DNS provider — a standard, common real-world pattern where the company handling domain ownership/registration is separate from the company answering DNS queries for it.
+
+- **Registrar** (Romanian provider) — owns the registration record, handles renewal/billing for the domain itself
+- **DNS provider** (Route 53) — answers "what does this domain point to," entirely independent of who registered it
+
+This required no AWS billing changes and fully sidestepped the payment restriction, while still delivering genuine, real public DNS resolution — a stronger result than working around the task with a non-resolving placeholder domain.
+
+### Hosted zone and delegation
+
+Created a **Public Hosted Zone** in Route 53 for `jankodev.site` (Private Hosted Zone was considered and rejected — private zones only resolve inside a VPC, which doesn't meet the requirement of public internet resolution).
+
+Route 53 automatically provisioned two records on zone creation:
+- **NS** — the four authoritative nameservers for this zone
+- **SOA** — zone metadata (primary nameserver, refresh/retry timing) managed automatically by Route 53
+
+Copied the four `awsdns` nameservers into the Romanian registrar's nameserver settings, delegating DNS authority for the domain to Route 53. First delegation attempt returned a registrar-side error (`domain delegation already in progress`), which resolved itself after a short wait — the change had actually been accepted despite the initial error message.
+
+### Alias record
+
+Created an **A record with Alias enabled**, pointing the domain root at the ALB's dual-stack DNS name (`dualstack.web-alb-*.eu-central-1.elb.amazonaws.com`). Alias records are a Route 53-specific mechanism for pointing at AWS-managed resources like an ALB — necessary because, unlike a static EC2 IP, an ALB's underlying IPs are not fixed and can change; Alias records resolve dynamically rather than pointing at a hardcoded address.
+
+### Verification
+
+```bash
+nslookup -type=NS jankodev.site
+```
+Confirmed all four `awsdns` nameservers resolving correctly, proving delegation had propagated.
+
+```bash
+curl -I http://jankodev.site
+```
+Returned `200 OK` directly from Apache — confirming the full chain end to end:
+
+**Romanian registrar → delegated nameservers → Route 53 hosted zone → Alias A record → ALB → target group → EC2 instance**
+
+## CloudFront Distribution with S3 Origin
+
+### Setup
+
+Created a fully private S3 bucket (initially `janko-static-site`, later rebuilt as `static-site-janko` — see troubleshooting below) with **Block all public access** enabled, no static website hosting mode, and a simple `index.html` uploaded. Verified the bucket was genuinely private before touching CloudFront:
+
+```bash
+curl -I https://<bucket>.s3.eu-central-1.amazonaws.com/index.html
+```
+Returned `403 AccessDenied` as expected — confirming a clean, non-public baseline before configuring any CDN access.
+
+Created a CloudFront distribution with this bucket as the origin, using **Origin Access Control (OAC)** rather than the deprecated Origin Access Identity (OAI) — the current AWS-recommended mechanism for granting a private S3 bucket read access to a specific CloudFront distribution only. CloudFront auto-generated and applied the required bucket policy, scoping `s3:GetObject` to the exact distribution ARN via a `SourceArn` condition — the same reference-based trust pattern used throughout this project for security groups.
+
+### Troubleshooting: persistent 403 despite correct configuration
+
+Initial testing returned `403 AccessDenied` (`server: AmazonS3`, `x-cache: Error from cloudfront`) — indicating CloudFront was reaching the origin, and S3 itself was rejecting the request.
+
+Methodically verified every layer of the CloudFront ↔ S3 trust chain, all of which checked out as individually correct:
+- Bucket policy content, `Resource` ARN, and `SourceArn` condition
+- AWS account ID match between policy and caller identity
+- OAC signing configuration (`sigv4`, `always`, origin type `s3`)
+- Origin domain format (regional REST endpoint, not the legacy website-hosting endpoint, which doesn't support OAC)
+- Default cache behavior's target origin ID
+- Bucket ownership controls (`BucketOwnerEnforced`) and object ACLs
+- Encryption type (SSE-S3, not SSE-KMS, ruling out a separate KMS key-policy permission layer)
+- Direct `aws s3 cp` download using admin credentials, confirming the object and bucket were genuinely fine outside of CloudFront
+
+With every individual piece correct, rebuilt the distribution and OAC entirely from scratch (deleted, waited for full removal, recreated) to rule out stale internal CloudFront state — the failure persisted identically on the rebuilt distribution.
+
+**Root cause, found by testing the literal object path instead of the bucket root:**
+```bash
+curl -I https://<distribution>.cloudfront.net/index.html   # → 200 OK
+curl -I https://<distribution>.cloudfront.net/             # → 403 AccessDenied
+```
+The distribution's **Default Root Object** field was empty, despite selecting `index.html` during creation. Without it, a request to `/` has no defined object to resolve to — CloudFront passes the request through essentially unresolved, and S3 denies it. Because the OAC policy grants only `s3:GetObject` (not `s3:ListBucket`), S3 has no way to distinguish "this object doesn't exist" from "you're not allowed to see this," and returns `AccessDenied` for both — the same error a genuine permissions failure would produce.
+
+**Fix:** set Default Root Object to `index.html` via the console (General tab → Edit), redeployed, and confirmed root path access returned `200 OK`.
+
+### Key lesson
+
+A `403 AccessDenied` from an S3 origin behind CloudFront does not always indicate a permissions problem. Testing the exact object path directly (bypassing root-object resolution) isolates whether the issue is genuinely a trust/policy failure or simply a missing/unresolved object — a fast, decisive diagnostic step that would have shortened this investigation considerably if applied earlier.
+
+## HTTPS via ACM — CloudFront and ALB Certificates
+
+### Two certificates, two regions
+
+Task required attaching a TLS certificate to both CloudFront and the ALB. These cannot share a single certificate object: ACM certificates are region-scoped, and **CloudFront only accepts certificates issued in `us-east-1`** regardless of where other resources live, while an ALB's certificate must be issued in the ALB's own region (`eu-central-1`). Two separate certificate requests were made for the same domain (`jankodev.site`) — one per region — rather than one shared certificate, which isn't technically possible across regions in ACM.
+
+### Validation troubleshooting
+
+Both certificates sat in `PENDING_VALIDATION` for roughly 24 hours with no progress. Investigation via `aws acm describe-certificate` showed both requests expected the **same DNS validation CNAME record** (identical name and value for both, despite being separate certificate objects in separate regions) — but `aws route53 list-resource-record-sets` confirmed the record had never actually been created in the hosted zone, despite requesting the certificates through a flow that should have offered automatic Route 53 record creation.
+
+Created the missing CNAME record manually:
+```bash
+aws route53 change-resource-record-sets --hosted-zone-id <zone-id> --change-batch '{...}'
+```
+Both certificates validated and moved to `ISSUED` status within minutes of the record going live — confirming the record's absence, not propagation timing, had been the actual blocker.
+
+### ALB — HTTPS listener
+
+Added a new listener to the ALB:
+- **HTTPS : 443**, forwarding to the existing target group, using the `eu-central-1` certificate
+
+Modified the existing **HTTP : 80** listener's action from "forward" to **redirect to HTTPS**, using a `301 Moved Permanently` status code (not `302`) — a 301 correctly signals a permanent move, matches how browsers cache and handle the redirect, and reflects that plain HTTP is not meant to serve real content going forward, only redirect. Redirect target preserved the original host/path/query dynamically (`#{host}`, `#{path}`, `#{query}`) rather than hardcoding a fixed destination.
+
+### Security group update
+
+`sg-webALB`'s existing rule only covered HTTP:80 — a separate, explicit HTTPS:443 inbound rule (source `0.0.0.0/0`) was required, since security group rules are scoped per port, not per "web traffic" generally. Adding the HTTPS listener alone did not open network-level access; the security group had to be updated independently.
+
+### Verification
+
+```bash
+curl -I http://jankodev.site    # → 301, redirects to HTTPS
+curl -I https://jankodev.site   # → 200 OK, served over TLS
+```
+
+> **Note:** Days before this verification, the ASG had been deliberately scaled to zero instances as a cost-saving measure during the CloudFront/S3 troubleshooting stretch. This produced a `503` from the ALB (`server: awselb/2.0`, no healthy targets) when first testing HTTPS — a reminder that ALB/HTTPS configuration and target availability are independent concerns; a correctly configured listener and certificate still return nothing useful without at least one healthy target behind it. Scaling the ASG back to a minimum of 1 resolved it.
+
+### CloudFront — custom domain and certificate
+
+The `us-east-1` certificate initially requested only covered `jankodev.site`, not `static.jankodev.site` — attempting to add the alternate domain name failed with a clear CloudFront validation error confirming certificates only cover the exact names they were issued for (no implicit subdomain coverage without a wildcard). Requested a second, purpose-specific `us-east-1` certificate for `static.jankodev.site` rather than a wildcard, consistent with the least-privilege reasoning applied earlier when choosing specific-domain certificates over `*.jankodev.site`.
+
+DNS validation for this certificate again required a manually created Route 53 CNAME record — the automatic record-creation option did not fire a second time, confirming this as a recurring, not one-off, gap in the certificate request flow rather than a fluke.
+
+Once issued, attached the certificate to the CloudFront distribution as an **Alternate Domain Name (CNAME)**: `static.jankodev.site`. Created a matching **Alias A record** in Route 53, pointing `static.jankodev.site` at the CloudFront distribution — the same alias mechanism used for the ALB, just targeting a different AWS-managed resource.
+
+### Final verification — both paths
+
+```bash
+curl -I https://jankodev.site           # → ALB, dynamic content, 200 OK
+curl -I https://static.jankodev.site    # → CloudFront + S3, static content, 200 OK
+```
+
+Both domains now resolve over HTTPS with valid, trusted certificates — `jankodev.site` serving the dynamic ASG-backed application through the ALB, and `static.jankodev.site` serving static content through CloudFront and S3 — two distinct, correctly isolated architectures sharing one parent domain.
+
+## Testing HTTPS End-to-End
+
+With certificates issued and attached, verified the complete client-facing HTTPS path using `curl`'s verbose output rather than just trusting the configuration on paper.
+
+### Target group protocol — confirming where TLS terminates
+
+```bash
+aws elbv2 describe-target-groups --query 'TargetGroups[*].[TargetGroupName,Protocol,Port]' --output table
+```
+
+Confirmed the target group communicates over plain **HTTP:80** internally. This means TLS terminates at the ALB — the client-to-ALB leg is fully encrypted, while the ALB-to-instance leg runs as plain HTTP within the VPC, never exposed to the public internet. This is standard TLS termination at the load balancer, distinct from end-to-end re-encryption (which would require a certificate on the instance itself, not implemented here).
+
+### Certificate validity
+
+```bash
+curl -v https://jankodev.site 2>&1 | grep -A 5 "Server certificate"
+```
+
+Confirmed:
+
+    subject: CN=jankodev.site
+    issuer: C=US; O=Amazon; CN=Amazon RSA 2048 M01
+    SSL certificate verified via OpenSSL.
+
+A genuine, trusted certificate — correct domain in the subject, verified without warnings.
+
+### Full request/response cycle
+
+```bash
+curl -Iv https://jankodev.site 2>&1 | grep -E "HTTP/|subject:|issuer:|SSL certificate"
+```
+
+Returned `HTTP/2 200`, negotiated over TLS, confirming the entire chain — client → ALB (HTTPS, valid cert) → target group (HTTP) → healthy EC2 instance — works end to end.
+
+### HTTP → HTTPS redirect
+
+```bash
+curl -I http://jankodev.site
+```
+
+Returned `301 Moved Permanently` with `Location: https://jankodev.site/` — confirming plain HTTP requests are correctly upgraded rather than served directly.
+
+### Summary
+
+| Check                 | Result                                           |
+|-----------------------|--------------------------------------------------|
+| Certificate validity  | Trusted, correct CN, no warnings                 |
+| TLS termination point | ALB (target group remains plain HTTP internally) |
+| HTTPS response        | `200 OK` over HTTP/2                             |
+| HTTP → HTTPS redirect | `301`, dynamic host/path preserved               |
+
+
