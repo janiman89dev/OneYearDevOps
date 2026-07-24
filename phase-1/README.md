@@ -507,8 +507,6 @@ Returned `301 Moved Permanently` with `Location: https://jankodev.site/` — con
 
 ## Architecture Diagram
 
-## Architecture Diagram
-
 ```mermaid
 ---
 title: AWS Arch — Phase 1
