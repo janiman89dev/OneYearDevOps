@@ -511,52 +511,46 @@ Returned `301 Moved Permanently` with `Location: https://jankodev.site/` — con
 
 ```mermaid
 ---
-title:  AWS Arch
+title: AWS Arch — Phase 1
 ---
-flowchart BT
-A1(public-subnet-1)
-A2(public-subnet-2)
-A3(private-subnet-1)
-A4(private-subnet-2)
-A(VPC)
-Sg1(sg-PublicWeb)
-Sg2(sg-AppPrivateSubnet)
-Sg3(sg-Database)
-Sg4(sg-webALB)
-D(RDS)
-B(S3)
-WWW((Internet))
-NG(NAT Gateway)
-LB(ALB)
-TG(Target Group)
-AS(ASG)
-E(EC2)
-R(Route 53)
-CF(CloudFront)
-subgraph Public Subnets
-A1-->NG
-A2-->NG
-end
-A-->A1
-A-->A2
-A-->A3
-A--->|unused|A4
-A1-->Sg1
-A2-->Sg1
-Sg3-->D
-subgraph Security Groups
-Sg4-->Sg1-->Sg2-->Sg3
-end
-A3-->NG
-A1-->LB
-A2-->LB
-LB-->AS
-AS-->TG-->E
-LB-->WWW
-WWW-->R-->Sg4-->LB
-E-->D
-NG-->WWW
-R-->CF
-CF-->B
+flowchart TD
+    WWW((Internet))
+    R(Route 53)
+    WWW --> R
+
+    R -->|jankodev.site| LB(ALB)
+    R -->|static.jankodev.site| CF(CloudFront)
+
+    CF --> B[(S3)]
+
+    LB --> AS(ASG)
+    AS --> TG(Target Group)
+    TG --> E(EC2)
+    E -->|"5432"| D[(RDS)]
+
+    E -.->|outbound only| NG(NAT Gateway)
+    NG -.-> WWW
+
+    subgraph VPC["VPC — 10.0.1.0/24"]
+        subgraph PubSubs["Public Subnets"]
+            LB
+            NG
+        end
+        subgraph Priv1["private-subnet-1"]
+            E
+        end
+        subgraph Priv2["private-subnet-2"]
+            D
+        end
+        A4[["private-subnet-2 second AZ<br/>reserved — unused"]]
+    end
+
+    subgraph SGs["Security Group Trust Chain"]
+        Sg4(sg-webALB) --> Sg1(sg-PublicWeb) --> Sg2(sg-AppPrivateSubnet) --> Sg3(sg-Database)
+    end
+
+    LB -.-> Sg4
+    E -.-> Sg2
+    D -.-> Sg3
 ```
 
