@@ -505,4 +505,58 @@ Returned `301 Moved Permanently` with `Location: https://jankodev.site/` — con
 | HTTPS response        | `200 OK` over HTTP/2                             |
 | HTTP → HTTPS redirect | `301`, dynamic host/path preserved               |
 
+## Architecture Diagram
+
+## Architecture Diagram
+
+```mermaid
+---
+title:  AWS Arch
+---
+flowchart BT
+A1(public-subnet-1)
+A2(public-subnet-2)
+A3(private-subnet-1)
+A4(private-subnet-2)
+A(VPC)
+Sg1(sg-PublicWeb)
+Sg2(sg-AppPrivateSubnet)
+Sg3(sg-Database)
+Sg4(sg-webALB)
+D(RDS)
+B(S3)
+WWW((Internet))
+NG(NAT Gateway)
+LB(ALB)
+TG(Target Group)
+AS(ASG)
+E(EC2)
+R(Route 53)
+CF(CloudFront)
+subgraph Public Subnets
+A1-->NG
+A2-->NG
+end
+A-->A1
+A-->A2
+A-->A3
+A--->|unused|A4
+A1-->Sg1
+A2-->Sg1
+Sg3-->D
+subgraph Security Groups
+Sg4-->Sg1-->Sg2-->Sg3
+end
+A3-->NG
+A1-->LB
+A2-->LB
+LB-->AS
+AS-->TG-->E
+LB-->WWW
+WWW-->R-->Sg4-->LB
+E-->D
+NG-->WWW
+R-->CF
+CF-->B
+```
 
